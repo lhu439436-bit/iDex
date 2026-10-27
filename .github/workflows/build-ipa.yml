@@ -1,0 +1,86 @@
+name: Build iDex IPA (unsigned)
+
+# 在云端 macOS 上把 iDex 编译成未签名 .ipa，供 Windows 上用 Sideloadly 自签安装。
+# 触发方式：仓库 → Actions → 左侧 “Build iDex IPA (unsigned)” → Run workflow
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 只有这个预览镜像带了 Xcode 27.1 / iOS 27.1 SDK（macos-26 最高只有 Xcode 26.6）
+    runs-on: xcode-27
+    timeout-minutes: 45
+
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+
+      - name: 选择 Xcode 27.1
+        run: |
+          set -euo pipefail
+          echo "== 镜像里已安装的 Xcode =="
+          ls -1d /Applications/Xcode*.app || true
+
+          if [ -d /Applications/Xcode_27.1.app ]; then
+            sudo xcode-select -s /Applications/Xcode_27.1.app
+          else
+            # 退而求其次：取版本号最高的 27.x
+            newest=$(ls -1d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1 || true)
+            if [ -z "$newest" ]; then
+              echo "::error::镜像里没有 Xcode 27.x，无法构建（工程要求 iOS 27 SDK）"
+              exit 1
+            fi
+            sudo xcode-select -s "$newest"
+          fi
+
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: 构建（关闭签名）
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project iDex.xcodeproj \
+            -target iDex \
+            -configuration Release \
+            -sdk iphoneos \
+            SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包成 ipa
+        run: |
+          set -euo pipefail
+          APP="$PWD/build/Release-iphoneos/iDex.app"
+
+          if [ ! -d "$APP" ]; then
+            echo "::error::没找到 $APP，构建产物路径可能不同"
+            find build -maxdepth 3 -name '*.app' -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "== Info.plist 关键字段 =="
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" || true
+
+          rm -rf dist
+          mkdir -p dist/Payload
+          cp -R "$APP" dist/Payload/
+          ( cd dist && zip -qry ../iDex-unsigned.ipa Payload )
+
+          ls -lh iDex-unsigned.ipa
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: iDex-unsigned-ipa
+          path: iDex-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
